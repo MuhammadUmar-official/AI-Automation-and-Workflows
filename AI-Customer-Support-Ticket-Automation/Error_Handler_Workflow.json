@@ -1,0 +1,143 @@
+{
+  "name": "Support Automation - Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-800, 300],
+      "notes": "Fires automatically whenever the main workflow (or any workflow pointing here in Settings > Error Workflow) fails."
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e1",
+              "name": "failedWorkflow",
+              "type": "string",
+              "value": "={{ $json.workflow.name }}"
+            },
+            {
+              "id": "e2",
+              "name": "failedNode",
+              "type": "string",
+              "value": "={{ $json.execution.lastNodeExecuted }}"
+            },
+            {
+              "id": "e3",
+              "name": "errorMessage",
+              "type": "string",
+              "value": "={{ $json.execution.error.message }}"
+            },
+            {
+              "id": "e4",
+              "name": "errorTimestamp",
+              "type": "string",
+              "value": "={{ $now.toISO() }}"
+            },
+            {
+              "id": "e5",
+              "name": "executionUrl",
+              "type": "string",
+              "value": "={{ $json.execution.url }}"
+            },
+            {
+              "id": "e6",
+              "name": "executionId",
+              "type": "string",
+              "value": "={{ $json.execution.id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "format-error-report",
+      "name": "Format Error Report",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-580, 300]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "GOOGLE_SHEET_DOCUMENT_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ErrorLog"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{ $json.errorTimestamp }}",
+            "Workflow": "={{ $json.failedWorkflow }}",
+            "Failed Node": "={{ $json.failedNode }}",
+            "Error Message": "={{ $json.errorMessage }}",
+            "Execution ID": "={{ $json.executionId }}",
+            "Execution URL": "={{ $json.executionUrl }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "log-error-sheet",
+      "name": "Log Error to Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [-360, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      },
+      "notes": "Sheet 'ErrorLog' must have header row: Timestamp | Workflow | Failed Node | Error Message | Execution ID | Execution URL"
+    },
+    {
+      "parameters": {
+        "sendTo": "admin@yourcompany.com",
+        "subject": "=[ALERT] Workflow failure: {{ $json.failedWorkflow }}",
+        "message": "=A workflow execution failed and needs attention.\n\nWorkflow: {{ $json.failedWorkflow }}\nFailed node: {{ $json.failedNode }}\nTime: {{ $json.errorTimestamp }}\nExecution ID: {{ $json.executionId }}\n\nError message:\n{{ $json.errorMessage }}\n\nView execution:\n{{ $json.executionUrl }}\n\n---\nThis is an automated alert from the Support Automation Error Handler.",
+        "options": { "appendAttribution": false }
+      },
+      "id": "notify-admin",
+      "name": "Notify Administrator",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [-140, 300],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "GMAIL_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      },
+      "notes": "Replace admin@yourcompany.com with the on-call/admin address."
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [[{ "node": "Format Error Report", "type": "main", "index": 0 }]]
+    },
+    "Format Error Report": {
+      "main": [[{ "node": "Log Error to Sheet", "type": "main", "index": 0 }]]
+    },
+    "Log Error to Sheet": {
+      "main": [[{ "node": "Notify Administrator", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "timezone": "Asia/Karachi"
+  },
+  "pinData": {},
+  "active": false
+}
