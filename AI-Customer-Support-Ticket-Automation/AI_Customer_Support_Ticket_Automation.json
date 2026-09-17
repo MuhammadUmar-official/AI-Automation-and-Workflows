@@ -1,0 +1,489 @@
+{
+  "name": "AI Customer Support Ticket Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            { "mode": "everyMinute" }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "is:unread label:customer-support"
+        },
+        "options": {
+          "downloadAttachments": false
+        }
+      },
+      "id": "gmail-trigger",
+      "name": "Gmail Trigger - New Support Email",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [-1600, 400],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "GMAIL_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      },
+      "notes": "Polls the 'customer-support' Gmail label every minute for unread mail. Replace the label/query in Filters to match your inbox setup."
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "customerName",
+              "type": "string",
+              "value": "={{ ($json.from || '').includes('<') ? $json.from.split('<')[0].replace(/\"/g,'').trim() : $json.from }}"
+            },
+            {
+              "id": "a2",
+              "name": "customerEmail",
+              "type": "string",
+              "value": "={{ ($json.from || '').match(/<(.+)>/) ? $json.from.match(/<(.+)>/)[1] : $json.from }}"
+            },
+            {
+              "id": "a3",
+              "name": "subject",
+              "type": "string",
+              "value": "={{ $json.subject }}"
+            },
+            {
+              "id": "a4",
+              "name": "message",
+              "type": "string",
+              "value": "={{ $json.textPlain || $json.snippet || '' }}"
+            },
+            {
+              "id": "a5",
+              "name": "receivedDate",
+              "type": "string",
+              "value": "={{ $json.date || $now.toISO() }}"
+            },
+            {
+              "id": "a6",
+              "name": "messageId",
+              "type": "string",
+              "value": "={{ $json.id }}"
+            },
+            {
+              "id": "a7",
+              "name": "threadId",
+              "type": "string",
+              "value": "={{ $json.threadId }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "extract-email-data",
+      "name": "Extract Email Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-1360, 400],
+      "notes": "Normalizes the raw Gmail Trigger payload into the fields the rest of the workflow depends on."
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-4.1-mini"
+        },
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "id": "openai-chat-model",
+      "name": "OpenAI Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [-1140, 600],
+      "credentials": {
+        "openAiApi": {
+          "id": "OPENAI_CREDENTIAL_ID",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n  \"category\": \"Billing\",\n  \"priority\": \"High\",\n  \"sentiment\": \"Negative\",\n  \"customerIntent\": \"Requesting refund for a duplicate charge on last month's invoice\",\n  \"summary\": \"Customer was billed twice for the same subscription and wants the duplicate charge refunded.\",\n  \"humanRequired\": true,\n  \"suggestedResponse\": \"Hi Jane, thank you for flagging this — I can see the duplicate charge on your account...\"\n}"
+      },
+      "id": "structured-output-parser",
+      "name": "Structured Output Parser",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [-980, 600]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are an AI customer support triage assistant. Analyze the customer email below and return ONLY structured JSON matching the required schema — no extra commentary.\n\nCustomer Name: {{ $('Extract Email Data').item.json.customerName }}\nCustomer Email: {{ $('Extract Email Data').item.json.customerEmail }}\nSubject: {{ $('Extract Email Data').item.json.subject }}\nReceived: {{ $('Extract Email Data').item.json.receivedDate }}\n\nMessage:\n{{ $('Extract Email Data').item.json.message }}\n\nRules:\n- category must be exactly one of: Billing, Technical, Refund, Account, Shipping, General.\n- priority must be exactly one of: Low, Medium, High, Urgent.\n- sentiment must be exactly one of: Positive, Neutral, Negative.\n- customerIntent: one short sentence describing what the customer actually wants.\n- summary: 1-2 sentence neutral summary of the issue for an internal ticket log.\n- humanRequired: true if the issue involves refunds above standard policy, account security/access/login problems, legal or churn threats, repeat/escalated complaints, or anything needing account-specific changes a bot cannot safely make. Otherwise false.\n- suggestedResponse: a professional, empathetic, ready-to-send reply addressed to the customer by first name. If humanRequired is true, phrase it as an internal-facing recommended reply for the agent to review and personalize — do not promise a resolution you cannot guarantee.",
+        "hasOutputParser": true,
+        "options": {}
+      },
+      "id": "ai-ticket-analysis",
+      "name": "AI Ticket Analysis",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.6,
+      "position": [-1140, 400],
+      "notes": "Classifies category/priority/sentiment, decides humanRequired, and drafts a suggested response as strict JSON via the Structured Output Parser."
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b1",
+              "name": "ticketId",
+              "type": "string",
+              "value": "={{ 'TCK-' + $now.format('yyyyMMdd') + '-' + Math.floor(Math.random()*9000+1000) }}"
+            },
+            {
+              "id": "b2",
+              "name": "date",
+              "type": "string",
+              "value": "={{ $now.toISO() }}"
+            },
+            {
+              "id": "b3",
+              "name": "customerName",
+              "type": "string",
+              "value": "={{ $('Extract Email Data').item.json.customerName }}"
+            },
+            {
+              "id": "b4",
+              "name": "customerEmail",
+              "type": "string",
+              "value": "={{ $('Extract Email Data').item.json.customerEmail }}"
+            },
+            {
+              "id": "b5",
+              "name": "subject",
+              "type": "string",
+              "value": "={{ $('Extract Email Data').item.json.subject }}"
+            },
+            {
+              "id": "b6",
+              "name": "messageId",
+              "type": "string",
+              "value": "={{ $('Extract Email Data').item.json.messageId }}"
+            },
+            {
+              "id": "b7",
+              "name": "threadId",
+              "type": "string",
+              "value": "={{ $('Extract Email Data').item.json.threadId }}"
+            },
+            {
+              "id": "b8",
+              "name": "category",
+              "type": "string",
+              "value": "={{ $json.output.category }}"
+            },
+            {
+              "id": "b9",
+              "name": "priority",
+              "type": "string",
+              "value": "={{ $json.output.priority }}"
+            },
+            {
+              "id": "b10",
+              "name": "sentiment",
+              "type": "string",
+              "value": "={{ $json.output.sentiment }}"
+            },
+            {
+              "id": "b11",
+              "name": "customerIntent",
+              "type": "string",
+              "value": "={{ $json.output.customerIntent }}"
+            },
+            {
+              "id": "b12",
+              "name": "summary",
+              "type": "string",
+              "value": "={{ $json.output.summary }}"
+            },
+            {
+              "id": "b13",
+              "name": "suggestedResponse",
+              "type": "string",
+              "value": "={{ $json.output.suggestedResponse }}"
+            },
+            {
+              "id": "b14",
+              "name": "humanRequired",
+              "type": "boolean",
+              "value": "={{ $json.output.humanRequired }}"
+            },
+            {
+              "id": "b15",
+              "name": "status",
+              "type": "string",
+              "value": "AI Processed"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "build-ticket-record",
+      "name": "Build Ticket Record",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-900, 400],
+      "notes": "Flattens the AI's structured output and email metadata into one clean ticket record, and mints a Ticket ID."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "GOOGLE_SHEET_DOCUMENT_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Tickets"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Ticket ID": "={{ $json.ticketId }}",
+            "Date": "={{ $json.date }}",
+            "Customer": "={{ $json.customerName }}",
+            "Email": "={{ $json.customerEmail }}",
+            "Subject": "={{ $json.subject }}",
+            "Category": "={{ $json.category }}",
+            "Priority": "={{ $json.priority }}",
+            "Sentiment": "={{ $json.sentiment }}",
+            "Summary": "={{ $json.summary }}",
+            "Suggested Response": "={{ $json.suggestedResponse }}",
+            "Human Required": "={{ $json.humanRequired }}",
+            "Status": "={{ $json.status }}",
+            "Message ID": "={{ $json.messageId }}",
+            "Thread ID": "={{ $json.threadId }}"
+          }
+        },
+        "options": {}
+      },
+      "id": "store-ticket-sheets",
+      "name": "Store Ticket in Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [-660, 400],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      },
+      "notes": "Sheet 'Tickets' must have header row: Ticket ID | Date | Customer | Email | Subject | Category | Priority | Sentiment | Summary | Suggested Response | Human Required | Status | Message ID | Thread ID"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.humanRequired }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            },
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.priority }}",
+              "rightValue": "Urgent",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "id": "c3",
+              "leftValue": "={{ $json.priority }}",
+              "rightValue": "High",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "requires-human-if",
+      "name": "Requires Human Intervention?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-420, 400],
+      "notes": "TRUE (output 0) = escalate to a human. FALSE (output 1) = safe to auto-respond."
+    },
+    {
+      "parameters": {
+        "sendTo": "support-team@yourcompany.com",
+        "subject": "=[Escalation] Ticket {{ $json.ticketId }} — {{ $json.priority }} priority — {{ $json.category }}",
+        "message": "=A ticket needs human review.\n\nTicket ID: {{ $json.ticketId }}\nCustomer: {{ $json.customerName }} ({{ $json.customerEmail }})\nSubject: {{ $json.subject }}\nCategory: {{ $json.category }}\nPriority: {{ $json.priority }}\nSentiment: {{ $json.sentiment }}\nCustomer intent: {{ $json.customerIntent }}\n\nSummary:\n{{ $json.summary }}\n\nAI-recommended reply (review and personalize before sending):\n{{ $json.suggestedResponse }}\n\nOriginal message:\n{{ $('Extract Email Data').item.json.message }}\n\n---\nThis ticket was NOT auto-answered. Please respond to the customer directly and update the ticket status once resolved.",
+        "options": { "appendAttribution": false }
+      },
+      "id": "notify-support-team",
+      "name": "Notify Support Team",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [-180, 280],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "GMAIL_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      },
+      "notes": "Replace support-team@yourcompany.com with your team's distribution address."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "GOOGLE_SHEET_DOCUMENT_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Tickets"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": ["Ticket ID"],
+          "value": {
+            "Ticket ID": "={{ $json.ticketId }}",
+            "Status": "Waiting for Human"
+          }
+        },
+        "options": {}
+      },
+      "id": "update-status-waiting",
+      "name": "Update Status - Waiting for Human",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [60, 280],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "reply",
+        "messageId": "={{ $('Extract Email Data').item.json.messageId }}",
+        "emailType": "text",
+        "message": "=Hi {{ $json.customerName }},\n\n{{ $json.suggestedResponse }}\n\nIf this doesn't fully resolve things, just reply to this email and a member of our team will follow up.\n\nBest,\nCustomer Support Team",
+        "options": { "appendAttribution": false }
+      },
+      "id": "send-automated-response",
+      "name": "Send Automated Response",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [-180, 520],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "GMAIL_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      },
+      "notes": "Replies in-thread using the original message ID so the customer sees a normal email reply."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "GOOGLE_SHEET_DOCUMENT_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Tickets"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": ["Ticket ID"],
+          "value": {
+            "Ticket ID": "={{ $json.ticketId }}",
+            "Status": "Responded"
+          }
+        },
+        "options": {}
+      },
+      "id": "update-status-responded",
+      "name": "Update Status - Responded",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [60, 520],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Gmail Trigger - New Support Email": {
+      "main": [[{ "node": "Extract Email Data", "type": "main", "index": 0 }]]
+    },
+    "Extract Email Data": {
+      "main": [[{ "node": "AI Ticket Analysis", "type": "main", "index": 0 }]]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [[{ "node": "AI Ticket Analysis", "type": "ai_languageModel", "index": 0 }]]
+    },
+    "Structured Output Parser": {
+      "ai_outputParser": [[{ "node": "AI Ticket Analysis", "type": "ai_outputParser", "index": 0 }]]
+    },
+    "AI Ticket Analysis": {
+      "main": [[{ "node": "Build Ticket Record", "type": "main", "index": 0 }]]
+    },
+    "Build Ticket Record": {
+      "main": [[{ "node": "Store Ticket in Google Sheets", "type": "main", "index": 0 }]]
+    },
+    "Store Ticket in Google Sheets": {
+      "main": [[{ "node": "Requires Human Intervention?", "type": "main", "index": 0 }]]
+    },
+    "Requires Human Intervention?": {
+      "main": [
+        [{ "node": "Notify Support Team", "type": "main", "index": 0 }],
+        [{ "node": "Send Automated Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Notify Support Team": {
+      "main": [[{ "node": "Update Status - Waiting for Human", "type": "main", "index": 0 }]]
+    },
+    "Send Automated Response": {
+      "main": [[{ "node": "Update Status - Responded", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "errorWorkflow": "ERROR_HANDLER_WORKFLOW_ID",
+    "timezone": "Asia/Karachi"
+  },
+  "pinData": {},
+  "active": false
+}
