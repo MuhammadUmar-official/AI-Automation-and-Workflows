@@ -1,0 +1,454 @@
+{
+  "name": "AI Invoice Processing Automation",
+  "nodes": [
+    {
+      "id": "sticky-config",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-360, -260],
+      "parameters": {
+        "width": 460,
+        "height": 420,
+        "content": "## Before you activate this workflow\n\n**Credentials to connect (top of each node):**\n- Gmail OAuth2 (trigger + all Gmail send nodes)\n- Google Sheets OAuth2 (all Sheets nodes)\n- HTTP Header Auth credential named for Anthropic, header `x-api-key` = your Anthropic API key (used by 'AI - Extract Invoice Fields')\n\n**Environment variables to set (Settings > Environments, or replace inline):**\n- `FINANCE_EMAIL` – finance team inbox for notifications\n- `ADMIN_EMAIL` – admin inbox for error alerts (used in error workflow)\n- `HIGH_VALUE_THRESHOLD` – numeric amount that triggers finance approval (default 5000)\n- `INVOICE_SHEET_ID` – Google Sheet ID that has tabs: Invoices, NeedsReview, Duplicates\n\n**Also do:**\n1. Import `invoice-error-handler-workflow.json` first, activate it, copy its Workflow ID.\n2. In this workflow's Settings, set 'Error Workflow' to that ID.\n3. Adjust the Gmail Trigger search query/label to match how invoices arrive in your inbox."
+      }
+    },
+    {
+      "id": "gmail-trigger",
+      "name": "Gmail Trigger - New Invoice Email",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [-140, 0],
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            { "mode": "everyX", "value": 5, "unit": "minutes" }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "has:attachment filename:pdf (invoice OR Invoice OR INVOICE)"
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": { "id": "REPLACE_ME", "name": "Gmail account" }
+      }
+    },
+    {
+      "id": "filter-has-attachments",
+      "name": "Filter - Has Attachments",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [100, 0],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-has-binary",
+              "leftValue": "={{ Object.keys($binary || {}).length }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "extract-pdf-attachments",
+      "name": "Extract PDF Attachments",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [340, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const output = [];\nfor (const item of $input.all()) {\n  const binaryKeys = Object.keys(item.binary || {});\n  for (const key of binaryKeys) {\n    const bin = item.binary[key];\n    const isPdf = (bin.mimeType && bin.mimeType.toLowerCase() === 'application/pdf') ||\n                  (bin.fileName && bin.fileName.toLowerCase().endsWith('.pdf'));\n    if (isPdf) {\n      output.push({\n        json: {\n          ...item.json,\n          attachmentFileName: bin.fileName || 'invoice.pdf',\n          attachmentKey: key\n        },\n        binary: { data: bin }\n      });\n    }\n  }\n}\n// Non-PDF attachments are simply skipped (ignored) since nothing is pushed for them\nreturn output;"
+      }
+    },
+    {
+      "id": "extract-pdf-text",
+      "name": "Extract PDF Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [580, 0],
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "data",
+        "options": {}
+      }
+    },
+    {
+      "id": "ai-extract-invoice-fields",
+      "name": "AI - Extract Invoice Fields",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [820, 0],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 2000, messages: [ { role: 'user', content: 'Extract invoice fields as strict JSON only, with no markdown fences and no commentary. Return an object with exactly these keys: invoiceNumber, vendorName, vendorEmail, invoiceDate (format YYYY-MM-DD), dueDate (format YYYY-MM-DD), currency, subtotal (number), tax (number), totalAmount (number), paymentStatus, lineItems (array of objects with description, quantity, unitPrice, amount). Use null for any field that cannot be found in the text. Here is the invoice text: ' + $json.text.slice(0, 15000) } ] }) }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": { "id": "REPLACE_ME", "name": "Anthropic API Key Header" }
+      }
+    },
+    {
+      "id": "parse-ai-json",
+      "name": "Parse AI JSON Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1060, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first();\nlet raw = '';\ntry {\n  const content = item.json.content;\n  raw = Array.isArray(content) ? content.map(c => c.text || '').join(' ') : (item.json.completion || '');\n} catch (e) {\n  raw = '';\n}\nraw = (raw || '').trim();\nif (raw.startsWith('```')) {\n  raw = raw.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();\n}\n\nlet parsed = null;\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  parsed = null;\n}\n\nconst trigger = $('Gmail Trigger - New Invoice Email').first().json;\nconst attachment = $('Extract PDF Attachments').first().json;\n\nif (!parsed) {\n  return [{\n    json: {\n      extractionError: true,\n      rawResponse: raw,\n      emailSubject: trigger.subject || '',\n      emailFrom: trigger.from || '',\n      attachmentFileName: attachment.attachmentFileName || '',\n      processedAt: new Date().toISOString()\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    ...parsed,\n    extractionError: false,\n    emailSubject: trigger.subject || '',\n    emailFrom: trigger.from || '',\n    attachmentFileName: attachment.attachmentFileName || '',\n    processedAt: new Date().toISOString()\n  }\n}];"
+      }
+    },
+    {
+      "id": "validate-invoice-data",
+      "name": "Validate Invoice Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const item = $input.first().json;\nconst errors = [];\n\nif (item.extractionError) errors.push('AI extraction failed - could not parse a JSON response from the model');\nif (!item.invoiceNumber) errors.push('Missing invoice number');\nif (!item.vendorName) errors.push('Missing vendor name');\nif (item.totalAmount === undefined || item.totalAmount === null || isNaN(Number(item.totalAmount))) errors.push('Missing or invalid total amount');\nif (!item.invoiceDate) errors.push('Missing invoice date');\nif (!item.dueDate) errors.push('Missing due date');\n\nreturn [{\n  json: {\n    ...item,\n    isValid: errors.length === 0,\n    validationErrors: errors\n  }\n}];"
+      }
+    },
+    {
+      "id": "search-duplicates",
+      "name": "Google Sheets - Search Duplicates",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1540, 0],
+      "parameters": {
+        "operation": "search",
+        "documentId": { "__rl": true, "mode": "id", "value": "={{ $env.INVOICE_SHEET_ID }}" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Invoices" },
+        "filtersUI": {
+          "values": [
+            { "lookupColumn": "invoiceNumber", "lookupValue": "={{ $json.invoiceNumber }}" }
+          ]
+        },
+        "options": { "returnAllMatches": true }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "REPLACE_ME", "name": "Google Sheets account" }
+      }
+    },
+    {
+      "id": "check-duplicate-match",
+      "name": "Check Duplicate Match",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const current = $('Validate Invoice Data').first().json;\nconst matches = $input.all().map(i => i.json);\n\nconst isDuplicate = matches.some(m =>\n  String(m.invoiceNumber || '').trim() === String(current.invoiceNumber || '').trim() &&\n  String(m.vendorName || '').trim().toLowerCase() === String(current.vendorName || '').trim().toLowerCase() &&\n  Number(m.totalAmount) === Number(current.totalAmount)\n);\n\nreturn [{\n  json: {\n    ...current,\n    isDuplicate,\n    duplicateCandidatesChecked: matches.length\n  }\n}];"
+      }
+    },
+    {
+      "id": "if-is-duplicate",
+      "name": "IF - Is Duplicate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2020, 0],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-dup",
+              "leftValue": "={{ $json.isDuplicate }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "update-sheet-duplicate",
+      "name": "Log Sheet - Mark Duplicate",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [2260, -140],
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "id", "value": "={{ $env.INVOICE_SHEET_ID }}" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Duplicates" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "invoiceNumber": "={{ $json.invoiceNumber }}",
+            "vendorName": "={{ $json.vendorName }}",
+            "vendorEmail": "={{ $json.vendorEmail }}",
+            "totalAmount": "={{ $json.totalAmount }}",
+            "emailFrom": "={{ $json.emailFrom }}",
+            "detectedAt": "={{ $json.processedAt }}",
+            "status": "Duplicate"
+          }
+        }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "REPLACE_ME", "name": "Google Sheets account" }
+      }
+    },
+    {
+      "id": "notify-finance-duplicate",
+      "name": "Notify Finance - Duplicate",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2500, -140],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $env.FINANCE_EMAIL }}",
+        "subject": "=Duplicate Invoice Detected: {{ $json.invoiceNumber }}",
+        "message": "=A possible duplicate invoice was received and was NOT stored in the main ledger.\n\nInvoice Number: {{ $json.invoiceNumber }}\nVendor: {{ $json.vendorName }}\nAmount: {{ $json.currency }} {{ $json.totalAmount }}\nReceived From: {{ $json.emailFrom }}\n\nPlease review the Duplicates tab in the tracking sheet and confirm whether this should be processed manually.",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": { "id": "REPLACE_ME", "name": "Gmail account" }
+      }
+    },
+    {
+      "id": "if-is-valid",
+      "name": "IF - Is Valid",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2260, 120],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-valid",
+              "leftValue": "={{ $json.isValid }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "log-sheet-needs-review",
+      "name": "Log Sheet - Needs Review",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [2500, 280],
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "id", "value": "={{ $env.INVOICE_SHEET_ID }}" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "NeedsReview" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "invoiceNumber": "={{ $json.invoiceNumber }}",
+            "vendorName": "={{ $json.vendorName }}",
+            "emailFrom": "={{ $json.emailFrom }}",
+            "attachmentFileName": "={{ $json.attachmentFileName }}",
+            "validationErrors": "={{ ($json.validationErrors || []).join('; ') }}",
+            "status": "Needs Review",
+            "loggedAt": "={{ $json.processedAt }}"
+          }
+        }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "REPLACE_ME", "name": "Google Sheets account" }
+      }
+    },
+    {
+      "id": "notify-finance-validation-failed",
+      "name": "Notify Finance - Validation Failed",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2740, 280],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $env.FINANCE_EMAIL }}",
+        "subject": "=Invoice Needs Manual Review: {{ $json.invoiceNumber || 'Unknown Invoice' }}",
+        "message": "=An incoming invoice could not be fully validated and requires manual review.\n\nFrom: {{ $json.emailFrom }}\nAttachment: {{ $json.attachmentFileName }}\nVendor (if detected): {{ $json.vendorName }}\nInvoice Number (if detected): {{ $json.invoiceNumber }}\n\nValidation issues:\n{{ ($json.validationErrors || []).join('\\n- ') }}\n\nPlease review the original email attachment and the 'NeedsReview' tab in the tracking sheet.",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": { "id": "REPLACE_ME", "name": "Gmail account" }
+      }
+    },
+    {
+      "id": "if-high-value",
+      "name": "IF - High Value Invoice",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2500, 60],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-high-value",
+              "leftValue": "={{ Number($json.totalAmount) }}",
+              "rightValue": "={{ Number($env.HIGH_VALUE_THRESHOLD || 5000) }}",
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "notify-finance-high-value",
+      "name": "Notify Finance - High Value",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2740, -20],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $env.FINANCE_EMAIL }}",
+        "subject": "=High-Value Invoice Requires Approval: {{ $json.invoiceNumber }}",
+        "message": "=A high-value invoice has been processed and is awaiting approval.\n\nInvoice Number: {{ $json.invoiceNumber }}\nVendor: {{ $json.vendorName }}\nAmount: {{ $json.currency }} {{ $json.totalAmount }}\nDue Date: {{ $json.dueDate }}\nThreshold: {{ $env.HIGH_VALUE_THRESHOLD || 5000 }}\n\nThis invoice has also been stored in the Invoices sheet with status 'Processed - Pending Approval'.",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": { "id": "REPLACE_ME", "name": "Gmail account" }
+      }
+    },
+    {
+      "id": "store-invoice",
+      "name": "Store Invoice - Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [2980, 60],
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "id", "value": "={{ $env.INVOICE_SHEET_ID }}" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Invoices" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "invoiceNumber": "={{ $json.invoiceNumber }}",
+            "vendorName": "={{ $json.vendorName }}",
+            "vendorEmail": "={{ $json.vendorEmail }}",
+            "invoiceDate": "={{ $json.invoiceDate }}",
+            "dueDate": "={{ $json.dueDate }}",
+            "currency": "={{ $json.currency }}",
+            "subtotal": "={{ $json.subtotal }}",
+            "tax": "={{ $json.tax }}",
+            "totalAmount": "={{ $json.totalAmount }}",
+            "paymentStatus": "={{ $json.paymentStatus }}",
+            "lineItemsJson": "={{ JSON.stringify($json.lineItems || []) }}",
+            "attachmentFileName": "={{ $json.attachmentFileName }}",
+            "emailFrom": "={{ $json.emailFrom }}",
+            "status": "={{ Number($json.totalAmount) > Number($env.HIGH_VALUE_THRESHOLD || 5000) ? 'Processed - Pending Approval' : 'Processed' }}",
+            "processedAt": "={{ $json.processedAt }}"
+          }
+        }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "REPLACE_ME", "name": "Google Sheets account" }
+      }
+    },
+    {
+      "id": "send-internal-confirmation",
+      "name": "Send Internal Confirmation",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [3220, 60],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $env.FINANCE_EMAIL }}",
+        "subject": "=Invoice Processed: {{ $json.invoiceNumber }}",
+        "message": "=Invoice successfully processed and stored.\n\nInvoice Number: {{ $json.invoiceNumber }}\nVendor: {{ $json.vendorName }}\nAmount: {{ $json.currency }} {{ $json.totalAmount }}\nInvoice Date: {{ $json.invoiceDate }}\nDue Date: {{ $json.dueDate }}\nPayment Status: {{ $json.paymentStatus }}\n\nNo action needed unless this was flagged as high-value.",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": { "id": "REPLACE_ME", "name": "Gmail account" }
+      }
+    }
+  ],
+  "connections": {
+    "Gmail Trigger - New Invoice Email": {
+      "main": [[{ "node": "Filter - Has Attachments", "type": "main", "index": 0 }]]
+    },
+    "Filter - Has Attachments": {
+      "main": [[{ "node": "Extract PDF Attachments", "type": "main", "index": 0 }]]
+    },
+    "Extract PDF Attachments": {
+      "main": [[{ "node": "Extract PDF Text", "type": "main", "index": 0 }]]
+    },
+    "Extract PDF Text": {
+      "main": [[{ "node": "AI - Extract Invoice Fields", "type": "main", "index": 0 }]]
+    },
+    "AI - Extract Invoice Fields": {
+      "main": [[{ "node": "Parse AI JSON Response", "type": "main", "index": 0 }]]
+    },
+    "Parse AI JSON Response": {
+      "main": [[{ "node": "Validate Invoice Data", "type": "main", "index": 0 }]]
+    },
+    "Validate Invoice Data": {
+      "main": [[{ "node": "Google Sheets - Search Duplicates", "type": "main", "index": 0 }]]
+    },
+    "Google Sheets - Search Duplicates": {
+      "main": [[{ "node": "Check Duplicate Match", "type": "main", "index": 0 }]]
+    },
+    "Check Duplicate Match": {
+      "main": [[{ "node": "IF - Is Duplicate", "type": "main", "index": 0 }]]
+    },
+    "IF - Is Duplicate": {
+      "main": [
+        [{ "node": "Log Sheet - Mark Duplicate", "type": "main", "index": 0 }],
+        [{ "node": "IF - Is Valid", "type": "main", "index": 0 }]
+      ]
+    },
+    "Log Sheet - Mark Duplicate": {
+      "main": [[{ "node": "Notify Finance - Duplicate", "type": "main", "index": 0 }]]
+    },
+    "IF - Is Valid": {
+      "main": [
+        [{ "node": "IF - High Value Invoice", "type": "main", "index": 0 }],
+        [{ "node": "Log Sheet - Needs Review", "type": "main", "index": 0 }]
+      ]
+    },
+    "Log Sheet - Needs Review": {
+      "main": [[{ "node": "Notify Finance - Validation Failed", "type": "main", "index": 0 }]]
+    },
+    "IF - High Value Invoice": {
+      "main": [
+        [{ "node": "Notify Finance - High Value", "type": "main", "index": 0 }],
+        [{ "node": "Store Invoice - Google Sheets", "type": "main", "index": 0 }]
+      ]
+    },
+    "Notify Finance - High Value": {
+      "main": [[{ "node": "Store Invoice - Google Sheets", "type": "main", "index": 0 }]]
+    },
+    "Store Invoice - Google Sheets": {
+      "main": [[{ "node": "Send Internal Confirmation", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "errorWorkflow": "REPLACE_WITH_ERROR_WORKFLOW_ID",
+    "timezone": "Asia/Karachi"
+  },
+  "pinData": {},
+  "versionId": "1"
+}

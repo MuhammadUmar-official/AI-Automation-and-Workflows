@@ -1,0 +1,97 @@
+{
+  "name": "Invoice Processing - Error Handler",
+  "nodes": [
+    {
+      "id": "sticky-note-error",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-360, -160],
+      "parameters": {
+        "width": 420,
+        "height": 260,
+        "content": "## Error Handler Workflow\n\n1. Import and activate this workflow FIRST.\n2. Copy its Workflow ID (visible in the URL bar once saved).\n3. Open 'AI Invoice Processing Automation' > Settings > Error Workflow, and select this workflow.\n\nAny node failure in the main workflow will trigger this automatically via the built-in Error Trigger node below."
+      }
+    },
+    {
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-120, 0],
+      "parameters": {}
+    },
+    {
+      "id": "format-error-data",
+      "name": "Format Error Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [120, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const data = $input.first().json;\n\nconst workflowName = (data.workflow && data.workflow.name) || 'Unknown Workflow';\nconst executionId = (data.execution && data.execution.id) || '';\nconst failedNode = (data.execution && data.execution.lastNodeExecuted) || 'Unknown Node';\n\nlet errorMessage = 'Unknown error';\ntry {\n  if (data.execution && data.execution.error) {\n    errorMessage = data.execution.error.message || JSON.stringify(data.execution.error);\n  }\n} catch (e) {\n  errorMessage = 'Could not parse error details';\n}\n\nreturn [{\n  json: {\n    workflowName,\n    executionId,\n    failedNode,\n    errorMessage,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      }
+    },
+    {
+      "id": "log-error-sheet",
+      "name": "Log Error - Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [360, 0],
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "mode": "id", "value": "={{ $env.INVOICE_SHEET_ID }}" },
+        "sheetName": { "__rl": true, "mode": "name", "value": "Errors" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $json.timestamp }}",
+            "workflowName": "={{ $json.workflowName }}",
+            "failedNode": "={{ $json.failedNode }}",
+            "errorMessage": "={{ $json.errorMessage }}",
+            "executionId": "={{ $json.executionId }}",
+            "status": "Logged"
+          }
+        }
+      },
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "REPLACE_ME", "name": "Google Sheets account" }
+      }
+    },
+    {
+      "id": "notify-admin",
+      "name": "Notify Admin - Gmail",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [600, 0],
+      "parameters": {
+        "operation": "send",
+        "sendTo": "={{ $env.ADMIN_EMAIL }}",
+        "subject": "=[ALERT] Invoice Automation Failed: {{ $json.workflowName }}",
+        "message": "=An error occurred in the invoice processing automation.\n\nWorkflow: {{ $json.workflowName }}\nFailed Node: {{ $json.failedNode }}\nExecution ID: {{ $json.executionId }}\nTime: {{ $json.timestamp }}\n\nError Message:\n{{ $json.errorMessage }}\n\nThis has been logged to the 'Errors' tab in the tracking sheet. Please investigate and, if needed, manually process any pending invoice from the original email.",
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": { "id": "REPLACE_ME", "name": "Gmail account" }
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [[{ "node": "Format Error Data", "type": "main", "index": 0 }]]
+    },
+    "Format Error Data": {
+      "main": [[{ "node": "Log Error - Google Sheets", "type": "main", "index": 0 }]]
+    },
+    "Log Error - Google Sheets": {
+      "main": [[{ "node": "Notify Admin - Gmail", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "timezone": "Asia/Karachi"
+  },
+  "pinData": {},
+  "versionId": "1"
+}
