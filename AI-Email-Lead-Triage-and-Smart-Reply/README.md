@@ -8,6 +8,7 @@ The workflow is designed around a **human-in-the-loop approach**: simple and saf
 
 ## Workflow Overview
 
+![AI Email Lead Triage & Smart Reply Automation](workflow.png)
 ![AI Email Lead Triage & Smart Reply Automation](workflow%283%29.png)
 ![AI Email Lead Triage & Smart Reply Automation](workflow.png)
 
