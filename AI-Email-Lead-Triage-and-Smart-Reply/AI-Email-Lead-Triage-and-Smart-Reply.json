@@ -1,0 +1,464 @@
+{
+  "name": "AI Email Lead Triage & Smart Reply Automation",
+  "nodes": [
+    {
+      "id": "gmail_trigger",
+      "name": "1. New Email Trigger (Gmail)",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [ -2400, 0 ],
+      "notes": "Polls the connected Gmail inbox for new messages. Adjust label/filter as needed (e.g. only INBOX, unread).",
+      "parameters": {
+        "pollTimes": { "item": [ { "mode": "everyMinute" } ] },
+        "simple": false,
+        "filters": { "labelIds": [ "INBOX" ] },
+        "options": { "downloadAttachments": true }
+      }
+    },
+    {
+      "id": "extract_clean_email",
+      "name": "2. Extract & Clean Email Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -2160, 0 ],
+      "notes": "Extracts core fields and cleans the body: strips HTML, removes signatures and quoted replies, fills in missing subject/sender defaults.",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "function stripHtml(html) {\n  if (!html) return '';\n  let text = html\n    .replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '')\n    .replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '')\n    .replace(/<br\\s*\\/?>(\\n)?/gi, '\\n')\n    .replace(/<\\/p>/gi, '\\n')\n    .replace(/<[^>]+>/g, '')\n    .replace(/&nbsp;/g, ' ')\n    .replace(/&amp;/g, '&')\n    .replace(/&lt;/g, '<')\n    .replace(/&gt;/g, '>')\n    .replace(/&#39;/g, \"'\")\n    .replace(/&quot;/g, '\"');\n  return text.trim();\n}\n\nfunction removeQuotedAndSignature(body) {\n  if (!body) return '';\n  let cleaned = body;\n\n  // Cut off common \"On ... wrote:\" quoted-reply markers\n  const quotePatterns = [\n    /On .{0,80} wrote:[\\s\\S]*$/i,\n    /-----Original Message-----[\\s\\S]*$/i,\n    /From: .{0,120}\\nSent: [\\s\\S]*$/i,\n    /^>.*$/gm\n  ];\n  for (const pattern of quotePatterns) {\n    cleaned = cleaned.split(pattern)[0];\n  }\n\n  // Cut off common signature delimiters\n  const sigPatterns = [\n    /\\n--\\s*\\n[\\s\\S]*$/,\n    /\\nBest regards[\\s\\S]*$/i,\n    /\\nKind regards[\\s\\S]*$/i,\n    /\\nSent from my (iPhone|Android|Samsung)[\\s\\S]*$/i,\n    /\\nThanks,\\s*\\n[\\s\\S]*$/i\n  ];\n  for (const pattern of sigPatterns) {\n    cleaned = cleaned.split(pattern)[0];\n  }\n\n  return cleaned.trim();\n}\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const j = item.json;\n\n  const messageId = j.id || j.messageId || '';\n  const threadId = j.threadId || '';\n  const headers = j.headers || {};\n\n  const subjectRaw = j.subject || headers.subject || '';\n  const fromRaw = j.from || headers.from || '';\n\n  // Parse \"Name <email@x.com>\" style sender\n  let senderName = '';\n  let senderEmail = '';\n  const match = /^(.*)<(.+)>$/.exec(fromRaw.trim());\n  if (match) {\n    senderName = match[1].replace(/\"/g, '').trim();\n    senderEmail = match[2].trim();\n  } else {\n    senderEmail = fromRaw.trim();\n  }\n  if (!senderName) senderName = 'Unknown Sender';\n  if (!senderEmail) senderEmail = 'unknown@unknown.com';\n\n  const subject = subjectRaw && subjectRaw.trim() ? subjectRaw.trim() : '(No Subject)';\n\n  let bodyRaw = j.text || j.html || j.snippet || '';\n  if (!j.text && j.html) {\n    bodyRaw = stripHtml(j.html);\n  }\n  let body = removeQuotedAndSignature(bodyRaw || '');\n  if (!body) body = '(Empty email body)';\n\n  const attachments = (j.attachments || []).map(a => ({\n    filename: a.filename || 'attachment',\n    mimeType: a.mimeType || 'unknown'\n  }));\n\n  out.push({\n    json: {\n      messageId,\n      threadId,\n      senderName,\n      senderEmail,\n      subject,\n      body,\n      receivedAt: j.date || new Date().toISOString(),\n      hasAttachments: attachments.length > 0,\n      attachments\n    }\n  });\n}\n\nreturn out;"
+      }
+    },
+    {
+      "id": "check_duplicate",
+      "name": "3a. Lookup Message ID in Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [ -1920, 0 ],
+      "notes": "Searches the Email Log sheet for this Message ID to see if it was already processed.",
+      "parameters": {
+        "operation": "read",
+        "documentId": { "mode": "list", "value": "REPLACE_WITH_GOOGLE_SHEET_ID" },
+        "sheetName": { "mode": "list", "value": "Email Log" },
+        "filtersUI": {
+          "values": [ { "lookupColumn": "Message ID", "lookupValue": "={{ $json.messageId }}" } ]
+        },
+        "options": { "returnAllMatches": false }
+      }
+    },
+    {
+      "id": "if_duplicate",
+      "name": "3b. Already Processed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [ -1680, 0 ],
+      "notes": "Routes already-seen Message IDs to Stop, new ones continue into the AI understanding step.",
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json['Message ID'] }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "stop_duplicate",
+      "name": "3c. Stop – Duplicate Email",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [ -1440, 120 ],
+      "notes": "Dead-ends the workflow for duplicate Message IDs. No further action taken.",
+      "parameters": {}
+    },
+    {
+      "id": "ai_understanding",
+      "name": "4. AI Email Understanding",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.8,
+      "position": [ -1440, -120 ],
+      "notes": "Classifies the email and returns a strict JSON verdict: category, intent, priority, confidence, and the AUTO_REPLY vs HUMAN_REVIEW decision.",
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": { "mode": "list", "value": "gpt-4o-mini" },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an email triage analyst for a business automation agency. Analyze the incoming email and respond with STRICT JSON ONLY, no markdown, no commentary, matching exactly this schema:\n{\n  \"category\": one of [\"Sales Inquiry\",\"Service Inquiry\",\"Product Question\",\"Pricing Request\",\"Meeting Request\",\"General Inquiry\",\"Customer Support\",\"Complaint\",\"Refund Request\",\"Partnership\",\"Job Opportunity\",\"Spam\",\"Other\"],\n  \"intent\": short string describing what the sender wants,\n  \"priority\": one of [\"Low\",\"Medium\",\"High\"],\n  \"isLead\": boolean,\n  \"responseRequired\": boolean,\n  \"summary\": one to two sentence summary of the email,\n  \"confidence\": number from 0 to 1,\n  \"autoReplySafe\": boolean — true ONLY if the request is low-risk, clear, and answerable purely from the approved business information below, with no negotiation, no pricing customization, no refunds, no legal/contractual matters, and no sensitive data involved,\n  \"humanReviewRequired\": boolean — true whenever autoReplySafe is false, confidence is below 0.75, the request is unclear, or ANY safety rule below applies,\n  \"reviewReason\": string explaining why human review is or is not required.\n\nHARD SAFETY RULES — always set humanReviewRequired = true and autoReplySafe = false when ANY of these apply:\n- custom pricing or price negotiation is requested\n- a refund is requested\n- the email is a complaint\n- legal or contractual information is requested\n- sensitive customer/account information is involved\n- the sender is asking for a business decision or authorization\n- a high-value lead is detected\n- you are not fully confident you can answer safely from approved information alone\n\nWhen in doubt, ALWAYS choose humanReviewRequired = true. Never guess or invent business information.\n\nAPPROVED BUSINESS INFORMATION (only source of truth for auto-replies):\n- We are an automation agency building n8n / AI-powered workflow systems (email triage, lead qualification, CRM automation, chatbots, reporting).\n- We offer discovery calls; booking link: https://calendly.com/your-business/intro-call\n- General services: workflow automation, AI integrations, CRM/email automation, custom internal tools.\n- We do not quote custom pricing over email — pricing is discussed on a call after a short discovery.\n- Support hours: Mon–Fri, 9am–6pm (business timezone)."
+            },
+            {
+              "role": "user",
+              "content": "=Sender: {{ $json.senderName }} <{{ $json.senderEmail }}>\nSubject: {{ $json.subject }}\nReceived: {{ $json.receivedAt }}\nHas Attachments: {{ $json.hasAttachments }}\n\nEmail Body:\n{{ $json.body }}"
+            }
+          ]
+        },
+        "options": { "temperature": 0.2, "responseFormat": "json_object" }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "parse_ai_decision",
+      "name": "5. Parse AI Decision (Safe)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -1200, -120 ],
+      "notes": "Parses the AI's JSON. If parsing fails or fields are missing, the email is defaulted to HUMAN_REVIEW per the safety rule.",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const CONFIDENCE_THRESHOLD = 0.75;\nconst out = [];\n\nfor (const item of $input.all()) {\n  const emailData = item.json;\n  let ai;\n\n  try {\n    const raw = emailData.message?.content ?? emailData.content ?? emailData.text ?? emailData.output ?? '{}';\n    ai = typeof raw === 'string' ? JSON.parse(raw) : raw;\n  } catch (err) {\n    // AI failed to return valid JSON -> fail safe to HUMAN_REVIEW\n    ai = {\n      category: 'Other',\n      intent: 'Unknown (AI parsing failed)',\n      priority: 'Medium',\n      isLead: false,\n      responseRequired: true,\n      summary: 'AI response could not be parsed.',\n      confidence: 0,\n      autoReplySafe: false,\n      humanReviewRequired: true,\n      reviewReason: 'AI output could not be parsed as JSON — routed to human review for safety.'\n    };\n  }\n\n  // Enforce the hard safety rule: never trust a low-confidence AUTO_REPLY\n  const confidence = typeof ai.confidence === 'number' ? ai.confidence : 0;\n  let autoReplySafe = ai.autoReplySafe === true && confidence >= CONFIDENCE_THRESHOLD;\n  let humanReviewRequired = ai.humanReviewRequired === true || !autoReplySafe;\n\n  const decision = autoReplySafe && !humanReviewRequired ? 'AUTO_REPLY' : 'HUMAN_REVIEW';\n\n  out.push({\n    json: {\n      ...emailData,\n      category: ai.category || 'Other',\n      intent: ai.intent || 'Unclear',\n      priority: ai.priority || 'Medium',\n      isLead: !!ai.isLead,\n      responseRequired: ai.responseRequired !== false,\n      summary: ai.summary || '',\n      confidence,\n      autoReplySafe,\n      humanReviewRequired,\n      reviewReason: ai.reviewReason || (decision === 'HUMAN_REVIEW' ? 'Did not meet auto-reply safety criteria.' : ''),\n      decision,\n      status: decision === 'AUTO_REPLY' ? 'Analyzing' : 'Human Review'\n    }\n  });\n}\n\nreturn out;"
+      }
+    },
+    {
+      "id": "route_decision",
+      "name": "6. Route: Auto Reply vs Human Review",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [ -960, -120 ],
+      "notes": "True branch = safe for AUTO_REPLY. False branch = HUMAN_REVIEW (default / fail-safe).",
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "AUTO_REPLY",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "generate_reply",
+      "name": "7a. Generate AI Reply Draft",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.8,
+      "position": [ -720, -260 ],
+      "notes": "Writes the customer-facing subject + body using ONLY approved business information. Used for both AUTO_REPLY and as a suggested draft for HUMAN_REVIEW.",
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": { "mode": "list", "value": "gpt-4o-mini" },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You write concise, professional email replies on behalf of an automation agency. Use ONLY the approved business information provided. Never invent facts, prices, timelines, or promises. Never negotiate. Include a clear next step (e.g. booking link) when appropriate. Respond with STRICT JSON ONLY: {\"subject\": string, \"body\": string}.\n\nAPPROVED BUSINESS INFORMATION:\n- Automation agency building n8n / AI-powered workflow systems (email triage, lead qualification, CRM automation, chatbots, reporting).\n- Discovery call booking link: https://calendly.com/your-business/intro-call\n- We do not quote custom pricing over email.\n- Support hours: Mon–Fri, 9am–6pm."
+            },
+            {
+              "role": "user",
+              "content": "=Sender: {{ $json.senderName }}\nOriginal Subject: {{ $json.subject }}\nCategory: {{ $json.category }}\nIntent: {{ $json.intent }}\nSummary: {{ $json.summary }}\n\nOriginal Email:\n{{ $json.body }}\n\nWrite the reply now."
+            }
+          ]
+        },
+        "options": { "temperature": 0.4, "responseFormat": "json_object" }
+      }
+    },
+    {
+      "id": "parse_reply",
+      "name": "7b. Parse Reply Draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -480, -260 ],
+      "notes": "Safely parses the generated subject/body, falling back to human review if generation failed.",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  let reply;\n  try {\n    const raw = j.message?.content ?? j.content ?? j.text ?? '{}';\n    reply = typeof raw === 'string' ? JSON.parse(raw) : raw;\n  } catch (err) {\n    reply = null;\n  }\n\n  if (!reply || !reply.body) {\n    out.push({ json: { ...j, decision: 'HUMAN_REVIEW', status: 'Human Review', reviewReason: 'Reply generation failed — routed to human review for safety.', replySubject: '', replyBody: '' } });\n  } else {\n    out.push({ json: { ...j, replySubject: reply.subject || ('Re: ' + j.subject), replyBody: reply.body } });\n  }\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "reroute_after_generation",
+      "name": "7c. Still Safe to Auto-Send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [ -240, -260 ],
+      "notes": "Final guard — if reply generation silently failed and flipped decision to HUMAN_REVIEW, send it down that path instead.",
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "AUTO_REPLY",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "send_reply",
+      "name": "8. Send Auto-Reply Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [ 0, -340 ],
+      "notes": "Sends the AI-generated reply directly to the sender, replying on the original thread.",
+      "parameters": {
+        "resource": "message",
+        "operation": "reply",
+        "messageId": "={{ $json.messageId }}",
+        "emailType": "text",
+        "message": "={{ $json.replyBody }}",
+        "options": { "senderName": "Your Business Name" }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "set_status_replied",
+      "name": "9a. Set Status: Replied",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [ 240, -340 ],
+      "notes": "",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "name": "status", "type": "string", "value": "Replied" },
+            { "name": "processedAt", "type": "string", "value": "={{ $now.toISO() }}" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "log_auto_reply",
+      "name": "9b. Log Auto-Reply to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [ 480, -340 ],
+      "notes": "Appends the final record for AUTO_REPLY emails to the Email Log sheet.",
+      "parameters": {
+        "operation": "append",
+        "documentId": { "mode": "list", "value": "REPLACE_WITH_GOOGLE_SHEET_ID" },
+        "sheetName": { "mode": "list", "value": "Email Log" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Message ID": "={{ $json.messageId }}",
+            "Thread ID": "={{ $json.threadId }}",
+            "Sender Name": "={{ $json.senderName }}",
+            "Sender Email": "={{ $json.senderEmail }}",
+            "Subject": "={{ $json.subject }}",
+            "Category": "={{ $json.category }}",
+            "Intent": "={{ $json.intent }}",
+            "Priority": "={{ $json.priority }}",
+            "AI Summary": "={{ $json.summary }}",
+            "AI Confidence": "={{ $json.confidence }}",
+            "Auto Reply Allowed": "={{ $json.autoReplySafe }}",
+            "Human Review Required": "={{ $json.humanReviewRequired }}",
+            "Review Reason": "={{ $json.reviewReason }}",
+            "Response": "={{ $json.replyBody }}",
+            "Status": "={{ $json.status }}",
+            "Processed At": "={{ $json.processedAt }}"
+          }
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "prepare_notification",
+      "name": "7d. Prepare Admin Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -720, 60 ],
+      "notes": "Builds the internal notification content for human review, including the AI's suggested draft.",
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const notificationBody = `A new email requires human review before any reply is sent.\\n\\n`\n    + `Sender: ${j.senderName} <${j.senderEmail}>\\n`\n    + `Subject: ${j.subject}\\n`\n    + `Category: ${j.category}\\n`\n    + `Intent: ${j.intent}\\n`\n    + `Priority: ${j.priority}\\n`\n    + `AI Confidence: ${j.confidence}\\n\\n`\n    + `AI Summary:\\n${j.summary}\\n\\n`\n    + `Why review is required:\\n${j.reviewReason}\\n\\n`\n    + `Original Email:\\n${j.body}\\n\\n`\n    + `Suggested AI Draft Reply:\\nSubject: ${j.replySubject || '(none generated)'}\\n${j.replyBody || '(none generated)'}\\n\\n`\n    + `Recommended Action: Review the draft, edit if needed, then approve to send.`;\n\n  out.push({ json: { ...j, notificationSubject: `[Review Needed] ${j.priority} priority — ${j.subject}`, notificationBody, status: 'Human Review' } });\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "send_admin_notification",
+      "name": "8b. Notify Admin (Human Review)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [ -480, 60 ],
+      "notes": "Sends the internal review notification to the business owner/admin inbox, with the AI's draft for approval.",
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "admin@your-business.com",
+        "subject": "={{ $json.notificationSubject }}",
+        "emailType": "text",
+        "message": "={{ $json.notificationBody }}",
+        "options": {}
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "set_status_human_review",
+      "name": "9c. Set Status: Human Review",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [ -240, 60 ],
+      "notes": "",
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "name": "status", "type": "string", "value": "Human Review" },
+            { "name": "processedAt", "type": "string", "value": "={{ $now.toISO() }}" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "log_human_review",
+      "name": "9d. Log Human Review to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [ 0, 60 ],
+      "notes": "Appends the record for HUMAN_REVIEW emails, including the suggested response, so a human can approve/edit and send it manually (or via a follow-up approval workflow).",
+      "parameters": {
+        "operation": "append",
+        "documentId": { "mode": "list", "value": "REPLACE_WITH_GOOGLE_SHEET_ID" },
+        "sheetName": { "mode": "list", "value": "Email Log" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Message ID": "={{ $json.messageId }}",
+            "Thread ID": "={{ $json.threadId }}",
+            "Sender Name": "={{ $json.senderName }}",
+            "Sender Email": "={{ $json.senderEmail }}",
+            "Subject": "={{ $json.subject }}",
+            "Category": "={{ $json.category }}",
+            "Intent": "={{ $json.intent }}",
+            "Priority": "={{ $json.priority }}",
+            "AI Summary": "={{ $json.summary }}",
+            "AI Confidence": "={{ $json.confidence }}",
+            "Auto Reply Allowed": "={{ $json.autoReplySafe }}",
+            "Human Review Required": "={{ $json.humanReviewRequired }}",
+            "Review Reason": "={{ $json.reviewReason }}",
+            "Response": "={{ $json.replyBody }}",
+            "Status": "={{ $json.status }}",
+            "Processed At": "={{ $json.processedAt }}"
+          }
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "error_trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [ -1440, 420 ],
+      "notes": "Fires whenever ANY node in this workflow throws (Gmail send failure, Sheets failure, AI request failure, etc.).",
+      "parameters": {}
+    },
+    {
+      "id": "notify_admin_error",
+      "name": "Notify Admin of Error",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [ -1200, 420 ],
+      "notes": "Alerts the admin whenever the workflow fails, so no lead is silently lost.",
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "admin@your-business.com",
+        "subject": "=[Workflow Error] AI Email Lead Triage — {{ $json.workflow.name }}",
+        "emailType": "text",
+        "message": "=An error occurred in the AI Email Lead Triage workflow.\n\nError: {{ $json.execution.error.message }}\nNode: {{ $json.execution.lastNodeExecuted }}\nTime: {{ $now.toISO() }}\n\nPlease check the execution log in n8n and follow up manually with the affected email so no lead is lost."
+      }
+    },
+    {
+      "id": "log_error",
+      "name": "Log Error to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [ -960, 420 ],
+      "notes": "Records the error for later auditing. Status is logged as 'Error' — no duplicate reply is ever sent for the same Message ID, since the Duplicate Check step re-runs first on retry.",
+      "parameters": {
+        "operation": "append",
+        "documentId": { "mode": "list", "value": "REPLACE_WITH_GOOGLE_SHEET_ID" },
+        "sheetName": { "mode": "list", "value": "Email Log" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Message ID": "={{ $json.execution?.data?.messageId || '' }}",
+            "Status": "Error",
+            "Review Reason": "={{ $json.execution.error.message }}",
+            "Processed At": "={{ $now.toISO() }}"
+          }
+        }
+      }
+    }
+  ],
+  "connections": {
+    "1. New Email Trigger (Gmail)": {
+      "main": [ [ { "node": "2. Extract & Clean Email Data", "type": "main", "index": 0 } ] ]
+    },
+    "2. Extract & Clean Email Data": {
+      "main": [ [ { "node": "3a. Lookup Message ID in Log", "type": "main", "index": 0 } ] ]
+    },
+    "3a. Lookup Message ID in Log": {
+      "main": [ [ { "node": "3b. Already Processed?", "type": "main", "index": 0 } ] ]
+    },
+    "3b. Already Processed?": {
+      "main": [
+        [ { "node": "3c. Stop – Duplicate Email", "type": "main", "index": 0 } ],
+        [ { "node": "4. AI Email Understanding", "type": "main", "index": 0 } ]
+      ]
+    },
+    "4. AI Email Understanding": {
+      "main": [ [ { "node": "5. Parse AI Decision (Safe)", "type": "main", "index": 0 } ] ]
+    },
+    "5. Parse AI Decision (Safe)": {
+      "main": [ [ { "node": "6. Route: Auto Reply vs Human Review", "type": "main", "index": 0 } ] ]
+    },
+    "6. Route: Auto Reply vs Human Review": {
+      "main": [
+        [ { "node": "7a. Generate AI Reply Draft", "type": "main", "index": 0 } ],
+        [ { "node": "7d. Prepare Admin Notification", "type": "main", "index": 0 } ]
+      ]
+    },
+    "7a. Generate AI Reply Draft": {
+      "main": [ [ { "node": "7b. Parse Reply Draft", "type": "main", "index": 0 } ] ]
+    },
+    "7b. Parse Reply Draft": {
+      "main": [ [ { "node": "7c. Still Safe to Auto-Send?", "type": "main", "index": 0 } ] ]
+    },
+    "7c. Still Safe to Auto-Send?": {
+      "main": [
+        [ { "node": "8. Send Auto-Reply Email", "type": "main", "index": 0 } ],
+        [ { "node": "7d. Prepare Admin Notification", "type": "main", "index": 0 } ]
+      ]
+    },
+    "8. Send Auto-Reply Email": {
+      "main": [ [ { "node": "9a. Set Status: Replied", "type": "main", "index": 0 } ] ]
+    },
+    "9a. Set Status: Replied": {
+      "main": [ [ { "node": "9b. Log Auto-Reply to Sheets", "type": "main", "index": 0 } ] ]
+    },
+    "7d. Prepare Admin Notification": {
+      "main": [ [ { "node": "8b. Notify Admin (Human Review)", "type": "main", "index": 0 } ] ]
+    },
+    "8b. Notify Admin (Human Review)": {
+      "main": [ [ { "node": "9c. Set Status: Human Review", "type": "main", "index": 0 } ] ]
+    },
+    "9c. Set Status: Human Review": {
+      "main": [ [ { "node": "9d. Log Human Review to Sheets", "type": "main", "index": 0 } ] ]
+    },
+    "Error Trigger": {
+      "main": [ [ { "node": "Notify Admin of Error", "type": "main", "index": 0 } ] ]
+    },
+    "Notify Admin of Error": {
+      "main": [ [ { "node": "Log Error to Sheets", "type": "main", "index": 0 } ] ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "pinData": {},
+  "versionId": "1.0.0"
+}
